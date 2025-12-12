@@ -1,4 +1,5 @@
 # Lightweight File Encryption Tool
+[![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/paypalme/GUNPANICHTUNSKUL)
 
 A simple, offline-first file and folder encryption tool.  
 Designed to protect your data **locally before upload or sharing**.
