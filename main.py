@@ -25,6 +25,8 @@ import sys
 import zipfile
 import tempfile
 from pathlib import Path
+import json
+import ctypes
 
 from PyQt6 import QtGui, QtWidgets
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -48,14 +50,56 @@ class Encryptor:
         return kdf.derive(password.encode("utf-8"))
 
     @staticmethod
+    def _set_file_metadata(path: Path, created: float, modified: float, accessed: float):
+        """Sets file timestamps, handling Windows creation time specifically."""
+        if os.name == 'nt':
+            try:
+                def _to_filetime(ts: float) -> ctypes.c_longlong:
+                    return ctypes.c_longlong(int(ts * 10_000_000) + 116_444_736_000_000_000)
+
+                kernel32 = ctypes.windll.kernel32
+                kernel32.CreateFileW.restype = ctypes.c_void_p
+                handle = kernel32.CreateFileW(
+                    str(path), 0x0100, 0x7, None, 3, 0x80, None
+                )
+                invalid = ctypes.c_void_p(-1).value
+                if handle is not None and handle != invalid:
+                    ctime = _to_filetime(created)
+                    atime = _to_filetime(accessed)
+                    mtime = _to_filetime(modified)
+                    kernel32.SetFileTime(
+                        ctypes.c_void_p(handle),
+                        ctypes.byref(ctime),
+                        ctypes.byref(atime),
+                        ctypes.byref(mtime),
+                    )
+                    kernel32.CloseHandle(ctypes.c_void_p(handle))
+            except Exception:
+                pass
+        else:
+            try:
+                os.utime(path, (accessed, modified))
+            except Exception:
+                pass
+
+    @staticmethod
     def _zip_folder(folder_path: Path, temp_zip_path: Path) -> None:
+        meta_manifest = {}
         with zipfile.ZipFile(temp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             base = folder_path.resolve()
             for root, _, files in os.walk(base):
                 for f in files:
                     full = Path(root) / f
                     rel = full.resolve().relative_to(base)
-                    zf.write(full, arcname=str(rel))
+                    rel_str = rel.as_posix()
+                    zf.write(full, arcname=rel_str)
+                    stat = full.stat()
+                    meta_manifest[rel_str] = {
+                        "ctime": stat.st_ctime,
+                        "mtime": stat.st_mtime,
+                        "atime": stat.st_atime
+                    }
+            zf.writestr(".fenc_metadata", json.dumps(meta_manifest))
 
     @staticmethod
     def encrypt_folder(folder_path: Path, password: str, output_file: Path, progress_cb=None) -> None:
@@ -158,6 +202,22 @@ class Encryptor:
                 output_folder.mkdir(parents=True, exist_ok=True)
                 with zipfile.ZipFile(temp_zip, "r") as zf:
                     zf.extractall(output_folder)
+                    try:
+                        meta_json = zf.read(".fenc_metadata")
+                        meta_manifest = json.loads(meta_json)
+                        for rel_path_str, stats in meta_manifest.items():
+                            dest_path = output_folder / rel_path_str
+                            if dest_path.exists():
+                                Encryptor._set_file_metadata(
+                                    dest_path,
+                                    stats.get("ctime", 0),
+                                    stats.get("mtime", 0),
+                                    stats.get("atime", 0)
+                                )
+                    except KeyError:
+                        pass  # No metadata file found
+                    except Exception as e:
+                        print(f"Warning: Failed to restore metadata: {e}")
 
 class DropLineEdit(QtWidgets.QLineEdit):
     def __init__(self, placeholder: str = "", parent=None):
