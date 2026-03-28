@@ -28,7 +28,7 @@ from pathlib import Path
 import json
 import ctypes
 
-from PyQt6 import QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -42,6 +42,42 @@ TAG_LEN = 16
 HEADER_LEN = len(MAGIC) + len(VERSION) + SALT_LEN + NONCE_LEN
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
+
+class CryptoWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int)
+    finished = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, mode: str, input_path: Path, password: str, output_path: Path):
+        super().__init__()
+        self.mode = mode
+        self.input_path = input_path
+        self.password = password
+        self.output_path = output_path
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            if self.mode == "encrypt":
+                Encryptor.encrypt_folder(
+                    self.input_path,
+                    self.password,
+                    self.output_path,
+                    progress_cb=self.progress.emit,
+                )
+            elif self.mode == "decrypt":
+                Encryptor.decrypt_file(
+                    self.input_path,
+                    self.password,
+                    self.output_path,
+                    progress_cb=self.progress.emit,
+                )
+            else:
+                raise ValueError("Unknown worker mode")
+            self.finished.emit(str(self.output_path))
+        except Exception as e:
+            self.failed.emit(str(e))
 
 class Encryptor:
     @staticmethod
@@ -242,6 +278,8 @@ class DropLineEdit(QtWidgets.QLineEdit):
 class EncryptTab(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
+        self.worker_thread = None
+        self.worker = None
         self._build_ui()
 
     def _build_ui(self):
@@ -269,9 +307,9 @@ class EncryptTab(QtWidgets.QWidget):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
 
-        run_btn = QtWidgets.QPushButton("Encrypt")
-        run_btn.setDefault(True)
-        run_btn.clicked.connect(self.run_encrypt)
+        self.run_btn = QtWidgets.QPushButton("Encrypt")
+        self.run_btn.setDefault(True)
+        self.run_btn.clicked.connect(self.run_encrypt)
 
         layout.addWidget(QtWidgets.QLabel("Folder to encrypt:"))
         layout.addWidget(self.input_path)
@@ -286,7 +324,7 @@ class EncryptTab(QtWidgets.QWidget):
         hl.addWidget(out_btn)
         layout.addLayout(hl)
         layout.addWidget(self.progress)
-        layout.addWidget(run_btn)
+        layout.addWidget(self.run_btn)
         layout.addStretch(1)
 
     def toggle_password(self, checked: bool):
@@ -319,20 +357,49 @@ class EncryptTab(QtWidgets.QWidget):
             if not out:
                 raise ValueError("Please choose an output file")
             out.parent.mkdir(parents=True, exist_ok=True)
+            self.progress.setValue(0)
+            self._set_busy(True)
 
-            def update_prog(p):
-                self.progress.setValue(p)
-                QtWidgets.QApplication.processEvents()
+            self.worker_thread = QtCore.QThread(self)
+            self.worker = CryptoWorker("encrypt", folder, password, out)
+            self.worker.moveToThread(self.worker_thread)
 
-            Encryptor.encrypt_folder(folder, password, out, progress_cb=update_prog)
-            self.progress.setValue(100)
-            QtWidgets.QMessageBox.information(self, "Done", f"Encrypted to:\n{out}")
+            self.worker_thread.started.connect(self.worker.run)
+            self.worker.progress.connect(self.progress.setValue)
+            self.worker.finished.connect(self._on_encrypt_success)
+            self.worker.failed.connect(self._on_encrypt_error)
+
+            self.worker.finished.connect(self.worker_thread.quit)
+            self.worker.failed.connect(self.worker_thread.quit)
+            self.worker_thread.finished.connect(self.worker.deleteLater)
+            self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+
+            self.worker_thread.start()
         except Exception as e:
+            self._set_busy(False)
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
+
+    def _set_busy(self, busy: bool):
+        self.run_btn.setEnabled(not busy)
+
+    def _on_encrypt_success(self, out_path: str):
+        self.progress.setValue(100)
+        self._set_busy(False)
+        self.worker = None
+        self.worker_thread = None
+        QtWidgets.QMessageBox.information(self, "Done", f"Encrypted to:\n{out_path}")
+
+    def _on_encrypt_error(self, message: str):
+        self._set_busy(False)
+        self.worker = None
+        self.worker_thread = None
+        QtWidgets.QMessageBox.critical(self, "Error", message)
 
 class DecryptTab(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
+        self.worker_thread = None
+        self.worker = None
         self._build_ui()
 
     def _build_ui(self):
@@ -360,9 +427,9 @@ class DecryptTab(QtWidgets.QWidget):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
 
-        run_btn = QtWidgets.QPushButton("Decrypt")
-        run_btn.setDefault(True)
-        run_btn.clicked.connect(self.run_decrypt)
+        self.run_btn = QtWidgets.QPushButton("Decrypt")
+        self.run_btn.setDefault(True)
+        self.run_btn.clicked.connect(self.run_decrypt)
 
         layout.addWidget(QtWidgets.QLabel("Encrypted file (.fenc):"))
         layout.addWidget(self.input_file)
@@ -377,7 +444,7 @@ class DecryptTab(QtWidgets.QWidget):
         hl.addWidget(out_btn)
         layout.addLayout(hl)
         layout.addWidget(self.progress)
-        layout.addWidget(run_btn)
+        layout.addWidget(self.run_btn)
         layout.addStretch(1)
 
     def toggle_password(self, checked: bool):
@@ -406,16 +473,43 @@ class DecryptTab(QtWidgets.QWidget):
                 raise ValueError("Password required")
             if not outdir:
                 raise ValueError("Please choose an output folder")
+            self.progress.setValue(0)
+            self._set_busy(True)
 
-            def update_prog(p):
-                self.progress.setValue(p)
-                QtWidgets.QApplication.processEvents()
+            self.worker_thread = QtCore.QThread(self)
+            self.worker = CryptoWorker("decrypt", infile, password, outdir)
+            self.worker.moveToThread(self.worker_thread)
 
-            Encryptor.decrypt_file(infile, password, outdir, progress_cb=update_prog)
-            self.progress.setValue(100)
-            QtWidgets.QMessageBox.information(self, "Done", f"Decrypted to:\n{outdir}")
+            self.worker_thread.started.connect(self.worker.run)
+            self.worker.progress.connect(self.progress.setValue)
+            self.worker.finished.connect(self._on_decrypt_success)
+            self.worker.failed.connect(self._on_decrypt_error)
+
+            self.worker.finished.connect(self.worker_thread.quit)
+            self.worker.failed.connect(self.worker_thread.quit)
+            self.worker_thread.finished.connect(self.worker.deleteLater)
+            self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+
+            self.worker_thread.start()
         except Exception as e:
+            self._set_busy(False)
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
+
+    def _set_busy(self, busy: bool):
+        self.run_btn.setEnabled(not busy)
+
+    def _on_decrypt_success(self, out_path: str):
+        self.progress.setValue(100)
+        self._set_busy(False)
+        self.worker = None
+        self.worker_thread = None
+        QtWidgets.QMessageBox.information(self, "Done", f"Decrypted to:\n{out_path}")
+
+    def _on_decrypt_error(self, message: str):
+        self._set_busy(False)
+        self.worker = None
+        self.worker_thread = None
+        QtWidgets.QMessageBox.critical(self, "Error", message)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
